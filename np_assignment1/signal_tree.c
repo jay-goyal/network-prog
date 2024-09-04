@@ -2,10 +2,13 @@
 #include <math.h>
 #include <semaphore.h>
 #include <signal.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/mman.h>
+#include <sys/wait.h>
 #include <threads.h>
+#include <time.h>
 #include <unistd.h>
 
 #define ANSI_COLOR_RESET "\x1b[0m"
@@ -18,12 +21,13 @@
 
 int waitcount, maxlevel, level = 0;
 int N, A, S;
-int points = 0;
-int num_signals;
+int points;
 sem_t *write_sem, *signal_sem;
 int* pid_idx;
 pid_t* pid_arr;
 int self_idx;
+pid_t pid1 = 0, pid2 = 0;
+bool to_kill = false;
 
 int get_level(int idx) { return ceil(log(idx - 1) / log(2) - 1); }
 int get_waitcount(int level) { return N - (int)(pow(2, level + 1) - 1); }
@@ -54,6 +58,12 @@ void alarm_handler(int signo) {
 }
 
 void handler(int signo) {
+    if (to_kill) {
+        sem_post(signal_sem + self_idx);
+        waitcount--;
+        return;
+    }
+
     if (waitcount > 0) {
         points -= S;
     } else if (waitcount > get_tgt(level)) {
@@ -62,13 +72,14 @@ void handler(int signo) {
         points += A;
     }
     waitcount--;
-    num_signals++;
 
-    if (num_signals == N - 1)
+    if (points <= 0) {
         printf(ANSI_COLOR_GREEN
-               "ALL SIGNALS PROCESSED FOR PROCESS AT LEVEL %d WITH IDX "
+               "POINTS ZERO OR NEGATIVE FOR PROCESS AT LEVEL %d WITH IDX "
                "%d. FINAL POINTS: %d" ANSI_COLOR_RESET "\n",
                level, self_idx, points);
+        to_kill = true;
+    }
 
     // AFTER HANDLER RETURNS A HANDLER CAN BE EXECUTED
     sem_post(signal_sem + self_idx);
@@ -126,12 +137,13 @@ int main(int argc, char* argv[]) {
     *pid_idx = 0;
 
 start_label:
-    num_signals = 0;
+    points = N;
     level++;
     waitcount = get_waitcount(level);
     to_spawn--;
     int lspawn, rspawn;
     lspawn = rspawn = to_spawn / 2;
+    int child_count = 0;
 
     signal(SIGUSR1, handler);
     signal(SIGALRM, alarm_handler);
@@ -143,7 +155,7 @@ start_label:
     // IF ODD NUMBER OF PROCESSES TO BE CREATED AFTER ROOT:
     // LEFT CREATES ONE EXTRA PROC THAN RIGHT
     if (to_spawn > 0) {
-        pid_t pid1 = fork();
+        pid1 = fork();
         if (pid1 == 0) {
             if (to_spawn % 2 == 1) {
                 lspawn++;
@@ -152,15 +164,17 @@ start_label:
             goto start_label;
         }
         to_spawn--;
+        child_count++;
     }
 
     if (to_spawn > 0) {
-        pid_t pid2 = fork();
+        pid2 = fork();
         if (pid2 == 0) {
             to_spawn = rspawn;
             goto start_label;
         }
         to_spawn--;
+        child_count++;
     }
 
     pid_t self_pid = getpid();
@@ -203,7 +217,32 @@ start_label:
         }
     }
 
-    while (1);
+    while (child_count > 0) {
+        if (pid1) {
+            if (waitpid(pid1, NULL, WNOHANG) > 0) {
+                pid1 = 0;
+                child_count--;
+            }
+        }
+        if (pid2) {
+            if (waitpid(pid2, NULL, WNOHANG) > 0) {
+                pid2 = 0;
+                child_count--;
+            }
+        }
+        sleep(1);
+    }
 
-    return 0;
+    while (!to_kill) sleep(1);
+
+    if (level == 0) {
+        sem_destroy(write_sem);
+        for (int i = 0; i < N; i++) sem_destroy(signal_sem + i);
+    }
+
+    printf(ANSI_COLOR_MAGENTA
+           "PROCESS AT LEVEL %d WITH IDX %d EXITING" ANSI_COLOR_RESET "\n",
+           level, self_idx);
+
+    exit(EXIT_SUCCESS);
 }
